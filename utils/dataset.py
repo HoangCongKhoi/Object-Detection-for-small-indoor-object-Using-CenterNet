@@ -93,56 +93,67 @@ class CenterNetDataset(Dataset):
                                     'file_name'])
 
         image = cv2.imread(img_path)
-        if image is None:
-            raise FileNotFoundError(f"Cannot read image {img_path}")
+        if image is None: raise FileNotFoundError(f"Cannot read image {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         h_orig, w_orig = image.shape[:2]
-        image = cv2.resize(image, (self.input_size, self.input_size))
 
-        # annotations
         bboxes = []
         classes = []
         if img_id in self.annotations:
             for ann in self.annotations[img_id]:
                 bboxes.append(ann['bbox'])
                 classes.append(CLASS_TO_ID[ann['class']])
-
         bboxes = np.array(bboxes, dtype=np.float32) if len(bboxes) > 0 else np.zeros((0, 4))
         classes = np.array(classes, dtype=np.int32)
 
-        # Scale bboxes
+        # ================= AUGMENTATION =================
+        if self.is_train:
+            # 1. Random Crop (Cắt ngẫu nhiên 80% - 100% ảnh gốc)
+            if np.random.rand() > 0.5:
+                crop_scale = np.random.uniform(0.8, 1.0)
+                crop_h, crop_w = int(h_orig * crop_scale), int(w_orig * crop_scale)
+                top = np.random.randint(0, h_orig - crop_h + 1)
+                left = np.random.randint(0, w_orig - crop_w + 1)
+
+                image = image[top:top + crop_h, left:left + crop_w]
+
+                if len(bboxes) > 0:
+                    bboxes[:, [0, 2]] -= left
+                    bboxes[:, [1, 3]] -= top
+                    bboxes[:, [0, 2]] = np.clip(bboxes[:, [0, 2]], 0, crop_w)
+                    bboxes[:, [1, 3]] = np.clip(bboxes[:, [1, 3]], 0, crop_h)
+
+                    # Giữ lại các box còn tồn tại sau khi cắt
+                    keep = (bboxes[:, 2] - bboxes[:, 0] > 5) & (bboxes[:, 3] - bboxes[:, 1] > 5)
+                    bboxes = bboxes[keep]
+                    classes = classes[keep]
+                h_orig, w_orig = crop_h, crop_w
+
+            # 2. Lật ngang
+            if np.random.rand() > 0.5:
+                image = image[:, ::-1, :]
+                if len(bboxes) > 0:
+                    bboxes[:, [0, 2]] = w_orig - bboxes[:, [2, 0]]
+
+            # 3. Color Jitter
+            if np.random.rand() > 0.5:
+                alpha = np.random.uniform(0.7, 1.3)
+                beta = np.random.randint(-30, 30)
+                image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+        # ================================================
+
+        # Resize & Normalize
+        image = cv2.resize(image, (self.input_size, self.input_size))
         if len(bboxes) > 0:
             bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * (self.input_size / w_orig)
             bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * (self.input_size / h_orig)
 
-        if self.is_train:
-            # 1. Lật ngang ngẫu nhiên (Xác suất 50%)
-            if np.random.rand() > 0.5:
-                image = image[:, ::-1, :]
-                if len(bboxes) > 0:
-                    bboxes[:, [0, 2]] = self.input_size - bboxes[:, [2, 0]]
-
-            # 2. Color Jitter: Thay đổi độ sáng và độ tương phản ngẫu nhiên (Xác suất 50%)
-            if np.random.rand() > 0.5:
-                alpha = np.random.uniform(0.7, 1.3)  # Hệ số tương phản (Contrast)
-                beta = np.random.randint(-30, 30)  # Độ sáng (Brightness)
-                image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
-                image = np.clip(image, 0, 255)
-
-            # 3. Gaussian Blur: Làm mờ nhẹ ngẫu nhiên giúp mô hình quen với vật thể nhỏ/mờ (Xác suất 30%)
-            if np.random.rand() > 0.7:
-                kernel_size = np.random.choice([3, 5])
-                image = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
-        # ===================================================================
-
-        # Normalize
         image = image.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        mean, std = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3), np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
         image = (image - mean) / std
-        image = image.transpose(2, 0, 1)  # (C, H, W)
+        image = image.transpose(2, 0, 1)
 
-        # TARGETS (Heatmap, WH, Reg offset)
+        # TARGETS
         num_classes = len(CLASSES)
         hm = np.zeros((num_classes, self.output_size, self.output_size), dtype=np.float32)
         wh = np.zeros((2, self.output_size, self.output_size), dtype=np.float32)
@@ -152,18 +163,13 @@ class CenterNetDataset(Dataset):
         for i in range(len(bboxes)):
             bbox = bboxes[i] / self.down_ratio
             cls_id = classes[i]
-
-            # Center
             h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
             if h > 0 and w > 0:
-                radius = gaussian_radius((math.ceil(h), math.ceil(w)))
-                radius = max(0, int(radius))
+                radius = max(0, int(gaussian_radius((math.ceil(h), math.ceil(w)))))
                 ct = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
                 ct_int = ct.astype(np.int32)
 
-                # Gaussian Heatmap
                 draw_umich_gaussian(hm[cls_id], ct_int, radius)
-
                 wh[0, ct_int[1], ct_int[0]] = w
                 wh[1, ct_int[1], ct_int[0]] = h
                 reg[0, ct_int[1], ct_int[0]] = ct[0] - ct_int[0]
