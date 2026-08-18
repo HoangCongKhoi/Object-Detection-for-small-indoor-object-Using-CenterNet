@@ -36,7 +36,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image_dir", required=True, type=str)
     parser.add_argument("--output", required=True, type=str)
-    parser.add_argument("--conf_thresh", type=float, default=0.25g)  # Ngưỡng độ tin cậy
+    parser.add_argument("--conf_thresh", type=float, default=0.25)  # Ngưỡng độ tin cậy
     parser.add_argument("--iou_thresh", type=float, default=0.5)  # Ngưỡng NMS
     return parser.parse_args()
 
