@@ -97,7 +97,6 @@ def main():
 
     checkpoint_path = os.path.join("models", "best.pth")
     download_model_if_missing(checkpoint_path)
-    print(f"\n[DEBUG] Đang load weight từ: {os.path.abspath(checkpoint_path)}\n")
 
     model = CenterNet(num_classes=5).to(device)
     if os.path.exists(checkpoint_path):

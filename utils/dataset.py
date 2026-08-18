@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+# Danh sách classes cố định theo đề bài
 CLASSES = ["bottle", "cup", "chair", "laptop", "backpack"]
 CLASS_TO_ID = {cls: idx for idx, cls in enumerate(CLASSES)}
 
@@ -63,8 +64,8 @@ class CenterNetDataset(Dataset):
         super().__init__()
         self.img_dir = img_dir
         self.input_size = input_size
-        self.down_ratio = down_ratio
-        self.output_size = input_size // down_ratio  #128x128
+        self.down_ratio = down_ratio  # ResNet18 upsample về tỉ lệ 1/4 so với ảnh gốc
+        self.output_size = input_size // down_ratio  # Mặc định 128x128
         self.is_train = is_train
 
         with open(annotation_path, 'r', encoding='utf-8') as f:
@@ -72,7 +73,7 @@ class CenterNetDataset(Dataset):
 
         self.images_info = {img['id']: img for img in data['images']}
 
-        #group by image_id
+        # Nhóm bboxes theo image_id
         self.annotations = {}
         for ann in data['annotations']:
             img_id = ann['image_id']
@@ -93,67 +94,83 @@ class CenterNetDataset(Dataset):
                                     'file_name'])
 
         image = cv2.imread(img_path)
-        if image is None: raise FileNotFoundError(f"Cannot read image {img_path}")
+        if image is None:
+            raise FileNotFoundError(f"Cannot read image {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
         h_orig, w_orig = image.shape[:2]
 
+        # Lấy annotations TRƯỚC KHI xử lý augmentation
         bboxes = []
         classes = []
         if img_id in self.annotations:
             for ann in self.annotations[img_id]:
                 bboxes.append(ann['bbox'])
                 classes.append(CLASS_TO_ID[ann['class']])
+
         bboxes = np.array(bboxes, dtype=np.float32) if len(bboxes) > 0 else np.zeros((0, 4))
         classes = np.array(classes, dtype=np.int32)
 
-        # ================= AUGMENTATION =================
+        # ================= TĂNG CƯỜNG DỮ LIỆU (DATA AUGMENTATION) =================
         if self.is_train:
-            # 1. Random Crop (Cắt ngẫu nhiên 80% - 100% ảnh gốc)
+            # 1. Thay đổi màu sắc (Color Jitter): Xác suất 50%
             if np.random.rand() > 0.5:
-                crop_scale = np.random.uniform(0.8, 1.0)
+                alpha = np.random.uniform(0.7, 1.3)  # Độ tương phản
+                beta = np.random.randint(-30, 30)  # Độ sáng
+                image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+            # 2. Cắt ngẫu nhiên (Random Crop): Xác suất 50%
+            if np.random.rand() > 0.5:
+                # Cắt từ 70% đến 100% diện tích ảnh gốc
+                crop_scale = np.random.uniform(0.7, 1.0)
                 crop_h, crop_w = int(h_orig * crop_scale), int(w_orig * crop_scale)
+
+                # Chọn tọa độ góc trái trên ngẫu nhiên
                 top = np.random.randint(0, h_orig - crop_h + 1)
                 left = np.random.randint(0, w_orig - crop_w + 1)
 
                 image = image[top:top + crop_h, left:left + crop_w]
 
                 if len(bboxes) > 0:
+                    # Dịch chuyển box theo tọa độ mới
                     bboxes[:, [0, 2]] -= left
                     bboxes[:, [1, 3]] -= top
+
+                    # Cắt gọn các phần box bị tràn ra ngoài vùng crop
                     bboxes[:, [0, 2]] = np.clip(bboxes[:, [0, 2]], 0, crop_w)
                     bboxes[:, [1, 3]] = np.clip(bboxes[:, [1, 3]], 0, crop_h)
 
-                    # Giữ lại các box còn tồn tại sau khi cắt
+                    # Xóa các box bị crop làm mất hẳn vật thể (rộng/cao <= 5 pixels)
                     keep = (bboxes[:, 2] - bboxes[:, 0] > 5) & (bboxes[:, 3] - bboxes[:, 1] > 5)
                     bboxes = bboxes[keep]
                     classes = classes[keep]
+
+                # Cập nhật lại kích thước gốc sau khi crop
                 h_orig, w_orig = crop_h, crop_w
 
-            # 2. Lật ngang
+            # 3. Lật ngang ngẫu nhiên (Horizontal Flip): Xác suất 50%
             if np.random.rand() > 0.5:
                 image = image[:, ::-1, :]
                 if len(bboxes) > 0:
                     bboxes[:, [0, 2]] = w_orig - bboxes[:, [2, 0]]
+        # ========================================================================
 
-            # 3. Color Jitter
-            if np.random.rand() > 0.5:
-                alpha = np.random.uniform(0.7, 1.3)
-                beta = np.random.randint(-30, 30)
-                image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
-        # ================================================
-
-        # Resize & Normalize
+        # Resize ảnh về kích thước mạng yêu cầu (ví dụ: 512x512)
         image = cv2.resize(image, (self.input_size, self.input_size))
+
+        # Scale bboxes theo tỉ lệ resize
         if len(bboxes) > 0:
             bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * (self.input_size / w_orig)
             bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * (self.input_size / h_orig)
 
+        # Chuẩn hóa ảnh (Normalize)
         image = image.astype(np.float32) / 255.0
-        mean, std = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3), np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
         image = (image - mean) / std
-        image = image.transpose(2, 0, 1)
+        image = image.transpose(2, 0, 1)  # (C, H, W)
 
-        # TARGETS
+        # --- TẠO TARGETS (Heatmap, WH, Reg offset) ---
         num_classes = len(CLASSES)
         hm = np.zeros((num_classes, self.output_size, self.output_size), dtype=np.float32)
         wh = np.zeros((2, self.output_size, self.output_size), dtype=np.float32)
@@ -161,15 +178,21 @@ class CenterNetDataset(Dataset):
         reg_mask = np.zeros((1, self.output_size, self.output_size), dtype=np.float32)
 
         for i in range(len(bboxes)):
-            bbox = bboxes[i] / self.down_ratio
+            bbox = bboxes[i] / self.down_ratio  # Đưa bbox về hệ tọa độ của Heatmap (128x128)
             cls_id = classes[i]
+
+            # Tính center
             h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
             if h > 0 and w > 0:
-                radius = max(0, int(gaussian_radius((math.ceil(h), math.ceil(w)))))
+                radius = gaussian_radius((math.ceil(h), math.ceil(w)))
+                radius = max(0, int(radius))
                 ct = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
                 ct_int = ct.astype(np.int32)
 
+                # Vẽ Gaussian Heatmap
                 draw_umich_gaussian(hm[cls_id], ct_int, radius)
+
+                # Lưu kích thước Box và Offset sai số (do làm tròn tọa độ pixel)
                 wh[0, ct_int[1], ct_int[0]] = w
                 wh[1, ct_int[1], ct_int[0]] = h
                 reg[0, ct_int[1], ct_int[0]] = ct[0] - ct_int[0]
