@@ -134,7 +134,7 @@ def main():
         total_val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                images = batch['image'].to(device)
+                images = batch['image'].float().to(device)
                 target_hm, target_wh, target_reg, reg_mask = batch['hm'].to(device), batch['wh'].to(device), batch[
                     'reg'].to(device), batch['reg_mask'].to(device)
                 pred_hm, pred_wh, pred_reg = model(images)
