@@ -104,7 +104,7 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{args.epochs}")
 
         for batch in pbar:
-            images = batch['image'].to(device)
+            images = batch['image'].float().to(device)
             target_hm, target_wh, target_reg, reg_mask = batch['hm'].to(device), batch['wh'].to(device), batch[
                 'reg'].to(device), batch['reg_mask'].to(device)
 
