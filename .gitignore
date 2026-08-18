@@ -1,6 +1,34 @@
-*.i
-*.ii
-*.gpu
-*.ptx
-*.cubin
-*.fatbin
+# Không push ảnh và nhãn lên Git vì dung lượng lớn và không cần thiết
+public/
+private/
+*.zip
+*.tar.gz
+*.rar
+
+# BỎ QUA TRỌNG SỐ MÔ HÌNH
+# Đề bài bắt buộc KHÔNG ĐƯỢC nộp kèm file weights
+models/*.pth
+models/*.pt
+checkpoints/
+
+# FILE KẾT QUẢ TRONG QUÁ TRÌNH CHẠY TEST
+predictions.json
+val_score.json
+val_oracle_score.json
+
+# MÔI TRƯỜNG PYTHON VÀ CACHE
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# JUPYTER NOTEBOOK (Nếu bạn có dùng để test)
+.ipynb_checkpoints/
+
+# CẤU HÌNH IDE VÀ HỆ ĐIỀU HÀNH
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
