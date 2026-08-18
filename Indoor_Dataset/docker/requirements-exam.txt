@@ -1,0 +1,10 @@
+# torch 2.7.1, torchvision 0.22.1, CUDA 12.6, and cuDNN 9 come from the base image.
+albumentations==2.0.8
+matplotlib==3.10.1
+numpy==2.1.2
+opencv-python-headless==4.11.0.86
+Pillow==11.1.0
+PyYAML==6.0.2
+scipy==1.15.2
+tensorboard==2.19.0
+tqdm==4.67.1
