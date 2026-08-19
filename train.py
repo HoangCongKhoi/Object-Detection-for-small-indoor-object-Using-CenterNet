@@ -83,7 +83,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # THÊM MỚI: Learning Rate Scheduler (Tự động giảm LR khi Loss đi ngang)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
     best_loss = float('inf')
 
