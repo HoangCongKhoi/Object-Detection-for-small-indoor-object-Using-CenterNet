@@ -38,9 +38,13 @@ def draw_umich_gaussian(heatmap, center, radius, k=1):
     """Vẽ vùng Gaussian xung quanh tâm vật thể trên Heatmap"""
     diameter = 2 * radius + 1
     gaussian = np.zeros((diameter, diameter), dtype=np.float32)
+
+    # THÊM MỚI: Ngăn lỗi chia cho 0 khi radius = 0 (vật thể quá nhỏ)
+    sigma = radius / 3 if radius > 0 else 1e-4
+
     for i in range(diameter):
         for j in range(diameter):
-            gaussian[i, j] = np.exp(-((i - radius) ** 2 + (j - radius) ** 2) / (2 * (radius / 3) ** 2))
+            gaussian[i, j] = np.exp(-((i - radius) ** 2 + (j - radius) ** 2) / (2 * sigma ** 2))
 
     x, y = int(center[0]), int(center[1])
     height, width = heatmap.shape[0:2]
@@ -53,7 +57,6 @@ def draw_umich_gaussian(heatmap, center, radius, k=1):
     if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:
         np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
     return heatmap
-
 
 def letterbox(img, bboxes, expected_size=(512, 512)):
     """Resize ảnh giữ nguyên tỷ lệ, bù viền màu xám, cập nhật lại bboxes"""
