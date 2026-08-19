@@ -1,17 +1,18 @@
-import json
 import os
-import math
+import json
 import cv2
+import math
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import torchvision.transforms as T
 
-# Danh sách classes cố định theo đề bài
 CLASSES = ["bottle", "cup", "chair", "laptop", "backpack"]
-CLASS_TO_ID = {cls: idx for idx, cls in enumerate(CLASSES)}
+CLASS_TO_ID = {cls: i for i, cls in enumerate(CLASSES)}
 
 
 def gaussian_radius(det_size, min_overlap=0.7):
+    """Tính toán bán kính Gaussian dựa trên kích thước vật thể và ngưỡng IoU tối thiểu"""
     height, width = det_size
     a1 = 1
     b1 = (height + width)
@@ -33,17 +34,13 @@ def gaussian_radius(det_size, min_overlap=0.7):
     return min(r1, r2, r3)
 
 
-def gaussian2D(shape, sigma=1):
-    m, n = [(ss - 1.) / 2. for ss in shape]
-    y, x = np.ogrid[-m:m + 1, -n:n + 1]
-    h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
-    h[h < np.finfo(h.dtype).eps * h.max()] = 0
-    return h
-
-
 def draw_umich_gaussian(heatmap, center, radius, k=1):
+    """Vẽ vùng Gaussian xung quanh tâm vật thể trên Heatmap"""
     diameter = 2 * radius + 1
-    gaussian = gaussian2D((diameter, diameter), sigma=diameter / 6)
+    gaussian = np.zeros((diameter, diameter), dtype=np.float32)
+    for i in range(diameter):
+        for j in range(diameter):
+            gaussian[i, j] = np.exp(-((i - radius) ** 2 + (j - radius) ** 2) / (2 * (radius / 3) ** 2))
 
     x, y = int(center[0]), int(center[1])
     height, width = heatmap.shape[0:2]
@@ -53,156 +50,140 @@ def draw_umich_gaussian(heatmap, center, radius, k=1):
 
     masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
     masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
-
     if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:
         np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
     return heatmap
 
 
-class CenterNetDataset(Dataset):
-    def __init__(self, annotation_path, img_dir, input_size=512, down_ratio=4, is_train=True):
-        super().__init__()
-        self.img_dir = img_dir
-        self.input_size = input_size
-        self.down_ratio = down_ratio  # ResNet18 upsample về tỉ lệ 1/4 so với ảnh gốc
-        self.output_size = input_size // down_ratio  # Mặc định 128x128
-        self.is_train = is_train
+def letterbox(img, bboxes, expected_size=(512, 512)):
+    """Resize ảnh giữ nguyên tỷ lệ, bù viền màu xám, cập nhật lại bboxes"""
+    ih, iw, _ = img.shape
+    ew, eh = expected_size
+    scale = min(ew / iw, eh / ih)
+    nw, nh = int(iw * scale), int(ih * scale)
 
-        with open(annotation_path, 'r', encoding='utf-8') as f:
+    img_resized = cv2.resize(img, (nw, nh))
+    new_img = np.full((eh, ew, 3), 128, dtype=np.uint8)  # Nền xám
+
+    dx, dy = (ew - nw) // 2, (eh - nh) // 2
+    new_img[dy:dy + nh, dx:dx + nw, :] = img_resized
+
+    new_bboxes = []
+    for bbox in bboxes:
+        xmin = bbox[0] * scale + dx
+        ymin = bbox[1] * scale + dy
+        xmax = bbox[2] * scale + dx
+        ymax = bbox[3] * scale + dy
+        new_bboxes.append([xmin, ymin, xmax, ymax, bbox[4]])
+
+    return new_img, np.array(new_bboxes), scale, dx, dy
+
+
+class CenterNetDataset(Dataset):
+    def __init__(self, json_file, img_dir, expected_size=(512, 512), is_train=True):
+        self.img_dir = img_dir
+        self.expected_size = expected_size
+        self.is_train = is_train
+        self.down_ratio = 4
+        self.output_size = (expected_size[0] // self.down_ratio, expected_size[1] // self.down_ratio)
+
+        with open(json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
-        self.images_info = {img['id']: img for img in data['images']}
-
-        # Nhóm bboxes theo image_id
+        self.images = {img['id']: img for img in data['images']}
         self.annotations = {}
         for ann in data['annotations']:
             img_id = ann['image_id']
             if img_id not in self.annotations:
                 self.annotations[img_id] = []
-            self.annotations[img_id].append(ann)
+            bbox = ann['bbox']  # [xmin, ymin, xmax, ymax]
+            cls_id = CLASS_TO_ID[ann['class']]
+            self.annotations[img_id].append(bbox + [cls_id])
 
-        self.image_ids = list(self.images_info.keys())
+        self.image_ids = list(self.images.keys())
+
+        # Chuẩn hóa ảnh
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+        self.color_jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
 
     def __len__(self):
         return len(self.image_ids)
 
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
-        img_info = self.images_info[img_id]
-        img_path = os.path.join(self.img_dir,
-                                img_info['file_name'].split('/')[-1] if '/' in img_info['file_name'] else img_info[
-                                    'file_name'])
+        img_info = self.images[img_id]
+        img_path = os.path.join(self.img_dir, img_info['file_name'].split('/')[-1])
 
-        image = cv2.imread(img_path)
-        if image is None:
-            raise FileNotFoundError(f"Cannot read image {img_path}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"Không tìm thấy ảnh: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        h_orig, w_orig = image.shape[:2]
+        bboxes = self.annotations.get(img_id, [])
+        bboxes = np.array(bboxes, dtype=np.float32)
 
-        # Lấy annotations TRƯỚC KHI xử lý augmentation
-        bboxes = []
-        classes = []
-        if img_id in self.annotations:
-            for ann in self.annotations[img_id]:
-                bboxes.append(ann['bbox'])
-                classes.append(CLASS_TO_ID[ann['class']])
+        # 1. Letterbox resizing
+        img, bboxes, _, _, _ = letterbox(img, bboxes, self.expected_size)
 
-        bboxes = np.array(bboxes, dtype=np.float32) if len(bboxes) > 0 else np.zeros((0, 4))
-        classes = np.array(classes, dtype=np.int32)
-
-        # ================= TĂNG CƯỜNG DỮ LIỆU (DATA AUGMENTATION) =================
+        # 2. Data Augmentation cho tập Train
         if self.is_train:
-            # 1. Thay đổi màu sắc (Color Jitter): Xác suất 50%
-            if np.random.rand() > 0.5:
-                alpha = np.random.uniform(0.7, 1.3)  # Độ tương phản
-                beta = np.random.randint(-30, 30)  # Độ sáng
-                image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+            # Color Jitter
+            img_pil = T.ToPILImage()(img)
+            img = np.array(self.color_jitter(img_pil))
 
-            # 2. Cắt ngẫu nhiên (Random Crop): Xác suất 50%
-            if np.random.rand() > 0.5:
-                # Cắt từ 70% đến 100% diện tích ảnh gốc
-                crop_scale = np.random.uniform(0.7, 1.0)
-                crop_h, crop_w = int(h_orig * crop_scale), int(w_orig * crop_scale)
-
-                # Chọn tọa độ góc trái trên ngẫu nhiên
-                top = np.random.randint(0, h_orig - crop_h + 1)
-                left = np.random.randint(0, w_orig - crop_w + 1)
-
-                image = image[top:top + crop_h, left:left + crop_w]
-
+            # Lật ngang (Horizontal Flip) xác suất 50%
+            if np.random.rand() < 0.5:
+                img = cv2.flip(img, 1)
                 if len(bboxes) > 0:
-                    # Dịch chuyển box theo tọa độ mới
-                    bboxes[:, [0, 2]] -= left
-                    bboxes[:, [1, 3]] -= top
+                    ew = self.expected_size[0]
+                    bboxes[:, [0, 2]] = ew - bboxes[:, [2, 0]]
 
-                    # Cắt gọn các phần box bị tràn ra ngoài vùng crop
-                    bboxes[:, [0, 2]] = np.clip(bboxes[:, [0, 2]], 0, crop_w)
-                    bboxes[:, [1, 3]] = np.clip(bboxes[:, [1, 3]], 0, crop_h)
+        # Chuẩn hóa ảnh
+        img = img.astype(np.float32) / 255.0
+        img = (img - self.mean) / self.std
+        img = img.transpose(2, 0, 1)  # HWC -> CHW
 
-                    # Xóa các box bị crop làm mất hẳn vật thể (rộng/cao <= 5 pixels)
-                    keep = (bboxes[:, 2] - bboxes[:, 0] > 5) & (bboxes[:, 3] - bboxes[:, 1] > 5)
-                    bboxes = bboxes[keep]
-                    classes = classes[keep]
-
-                # Cập nhật lại kích thước gốc sau khi crop
-                h_orig, w_orig = crop_h, crop_w
-
-            # 3. Lật ngang ngẫu nhiên (Horizontal Flip): Xác suất 50%
-            if np.random.rand() > 0.5:
-                image = image[:, ::-1, :]
-                if len(bboxes) > 0:
-                    bboxes[:, [0, 2]] = w_orig - bboxes[:, [2, 0]]
-        # ========================================================================
-
-        # Resize ảnh về kích thước mạng yêu cầu (ví dụ: 512x512)
-        image = cv2.resize(image, (self.input_size, self.input_size))
-
-        # Scale bboxes theo tỉ lệ resize
-        if len(bboxes) > 0:
-            bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * (self.input_size / w_orig)
-            bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * (self.input_size / h_orig)
-
-        # Chuẩn hóa ảnh (Normalize)
-        image = image.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
-        image = (image - mean) / std
-        image = image.transpose(2, 0, 1)  # (C, H, W)
-
-        # --- TẠO TARGETS (Heatmap, WH, Reg offset) ---
+        # 3. Khởi tạo nhãn đầu ra (Heatmap, WH, Reg)
         num_classes = len(CLASSES)
-        hm = np.zeros((num_classes, self.output_size, self.output_size), dtype=np.float32)
-        wh = np.zeros((2, self.output_size, self.output_size), dtype=np.float32)
-        reg = np.zeros((2, self.output_size, self.output_size), dtype=np.float32)
-        reg_mask = np.zeros((1, self.output_size, self.output_size), dtype=np.float32)
+        out_w, out_h = self.output_size
 
-        for i in range(len(bboxes)):
-            bbox = bboxes[i] / self.down_ratio  # Đưa bbox về hệ tọa độ của Heatmap (128x128)
-            cls_id = classes[i]
+        hm = np.zeros((num_classes, out_h, out_w), dtype=np.float32)
+        wh = np.zeros((100, 2), dtype=np.float32)  # Giới hạn tối đa 100 vật thể
+        reg = np.zeros((100, 2), dtype=np.float32)
+        ind = np.zeros((100), dtype=np.int64)
+        reg_mask = np.zeros((100), dtype=np.uint8)
 
-            # Tính center
-            h, w = bbox[3] - bbox[1], bbox[2] - bbox[0]
+        # Sinh Ground Truth
+        for i, bbox in enumerate(bboxes):
+            if i >= 100: break
+
+            # Thu nhỏ bbox theo down_ratio
+            bbox_down = bbox[:4] / self.down_ratio
+            cls_id = int(bbox[4])
+
+            h, w = bbox_down[3] - bbox_down[1], bbox_down[2] - bbox_down[0]
             if h > 0 and w > 0:
                 radius = gaussian_radius((math.ceil(h), math.ceil(w)))
                 radius = max(0, int(radius))
-                ct = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
+
+                ct = np.array([(bbox_down[0] + bbox_down[2]) / 2, (bbox_down[1] + bbox_down[3]) / 2], dtype=np.float32)
                 ct_int = ct.astype(np.int32)
 
-                # Vẽ Gaussian Heatmap
+                # Vẽ Heatmap
                 draw_umich_gaussian(hm[cls_id], ct_int, radius)
 
-                # Lưu kích thước Box và Offset sai số (do làm tròn tọa độ pixel)
-                wh[0, ct_int[1], ct_int[0]] = w
-                wh[1, ct_int[1], ct_int[0]] = h
-                reg[0, ct_int[1], ct_int[0]] = ct[0] - ct_int[0]
-                reg[1, ct_int[1], ct_int[0]] = ct[1] - ct_int[1]
-                reg_mask[0, ct_int[1], ct_int[0]] = 1
+                # Lưu thông tin W, H và Offset
+                wh[i] = 1. * w, 1. * h
+                ind[i] = ct_int[1] * out_w + ct_int[0]
+                reg[i] = ct - ct_int
+                reg_mask[i] = 1
 
         return {
-            'image': torch.from_numpy(image),
+            'image': torch.from_numpy(img),
             'hm': torch.from_numpy(hm),
             'wh': torch.from_numpy(wh),
             'reg': torch.from_numpy(reg),
+            'ind': torch.from_numpy(ind),
             'reg_mask': torch.from_numpy(reg_mask)
         }
