@@ -1,187 +1,159 @@
+import argparse
 import os
 import json
-import argparse
-import urllib.request
 import cv2
-import numpy as np
 import torch
-import torch.nn.functional as F
-import torchvision.ops as ops
+import requests
 from tqdm import tqdm
+from torchvision.transforms import functional as F
 
-from models.centernet import CenterNet
+from models.detector import IndoorDetector
+from utils.metrics import custom_nms
 from utils.dataset import CLASSES
 
 
-def download_model_if_missing(checkpoint_path):
+def download_weights(save_path):
     """
-    Tự động tải file weight nếu chưa tồn tại.
-    SINH VIÊN CẦN THAY THẾ URL DƯỚI ĐÂY bằng link direct tới file best.pth của mình.
+    Cơ chế tự động tải trọng số khi file best.pth chưa tồn tại.
+    LƯU Ý: Bạn cần thay thế URL bên dưới bằng link tải trực tiếp từ Google Drive hoặc GitHub Releases của bạn sau khi train xong.
     """
-    if not os.path.exists(checkpoint_path):
-        print(f"[INFO] Weight file không tồn tại ở {checkpoint_path}. Bắt đầu tải xuống...")
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-
-        # TODO: Đổi link GitHub Releases hoặc Google Drive của bạn sau khi train xong
-        url = "https://github.com/your-username/your-repo/releases/download/v1.0/best.pth"
-        try:
-            # urllib.request.urlretrieve(url, checkpoint_path) # Bỏ comment khi đã cấu hình URL thật
-            print("[WARNING] Bạn chưa cấu hình URL tải file trong predict.py!")
-        except Exception as e:
-            print(f"Lỗi khi tải weight: {e}")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image_dir", required=True, type=str)
-    parser.add_argument("--output", required=True, type=str)
-    parser.add_argument("--conf_thresh", type=float, default=0.3)  # Ngưỡng tin cậy
-    parser.add_argument("--iou_thresh", type=float, default=0.4)  # Ngưỡng NMS
-    return parser.parse_args()
+    url = "https://github.com/your-username/your-repo/releases/download/v1.0/best.pth"
+    print(f"Không tìm thấy trọng số cục bộ. Đang tự động tải từ: {url}")
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(save_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("Tải trọng số thành công!")
+        else:
+            print("Cảnh báo: Không thể tải từ URL trên. Vui lòng kiểm tra lại đường dẫn.")
+    except Exception as e:
+        print(f"Lỗi kết nối khi tải trọng số: {e}")
 
 
-def letterbox_inference(img, expected_size=(512, 512)):
-    """Resize ảnh giữ nguyên tỷ lệ để feed vào model, trả về các tham số để scale ngược lại"""
-    ih, iw, _ = img.shape
-    ew, eh = expected_size
-    scale = min(ew / iw, eh / ih)
-    nw, nh = int(iw * scale), int(ih * scale)
+def decode_predictions(preds, conf_thresh=0.25, stride=16, img_size=512):
+    pred_cls = torch.softmax(preds[0:5, :, :], dim=0)
+    pred_obj = torch.sigmoid(preds[5, :, :])
+    pred_txty = torch.sigmoid(preds[6:8, :, :])
+    pred_twth = torch.exp(preds[8:10, :, :])
 
-    img_resized = cv2.resize(img, (nw, nh))
-    new_img = np.full((eh, ew, 3), 128, dtype=np.uint8)
+    S = preds.shape[1]
+    grid_y, grid_x = torch.meshgrid(torch.arange(S), torch.arange(S), indexing='ij')
 
-    dx, dy = (ew - nw) // 2, (eh - nh) // 2
-    new_img[dy:dy + nh, dx:dx + nw, :] = img_resized
+    scores_obj = pred_obj
+    mask = scores_obj > conf_thresh
 
-    return new_img, scale, dx, dy
+    if mask.sum() == 0:
+        return []
 
+    grid_x = grid_x[mask]
+    grid_y = grid_y[mask]
 
-def decode_centernet(hm, wh, reg, K=100):
-    """Giải mã Heatmap thành Bboxes, sử dụng Max Pooling làm NMS cục bộ"""
-    batch, cat, height, width = hm.size()
+    scores = scores_obj[mask]
+    classes = torch.argmax(pred_cls[:, mask], dim=0)
 
-    # Tìm đỉnh (Peak) bằng Max Pooling 3x3
-    hmax = F.max_pool2d(hm, kernel_size=3, stride=1, padding=1)
-    keep = (hmax == hm).float()
-    hm = hm * keep
+    cx = (pred_txty[0][mask] + grid_x) * stride
+    cy = (pred_txty[1][mask] + grid_y) * stride
+    w = pred_twth[0][mask] * stride
+    h = pred_twth[1][mask] * stride
 
-    hm = hm.view(batch, -1)
-    scores, indices = torch.topk(hm, K)
+    x1 = cx - w / 2
+    y1 = cy - h / 2
+    x2 = cx + w / 2
+    y2 = cy + h / 2
 
-    classes = (indices // (height * width)).int()
-    indices = indices % (height * width)
-    ys = (indices // width).int()
-    xs = (indices % width).int()
+    boxes = torch.stack([x1, y1, x2, y2], dim=1)
+    boxes = torch.clamp(boxes, min=0, max=img_size)
 
-    reg = reg.view(batch, 2, -1)
-    wh = wh.view(batch, 2, -1)
+    results = []
+    for c in range(5):
+        c_mask = classes == c
+        if c_mask.sum() == 0:
+            continue
 
-    xs_reg = xs.view(batch, 1, K).expand(batch, 2, K)
-    ys_reg = ys.view(batch, 1, K).expand(batch, 2, K)
+        c_boxes = boxes[c_mask]
+        c_scores = scores[c_mask]
 
-    out_reg = reg.gather(2, ys_reg * width + xs_reg)
-    out_wh = wh.gather(2, ys_reg * width + xs_reg)
-
-    xs = xs.float() + out_reg[:, 0, :]
-    ys = ys.float() + out_reg[:, 1, :]
-    w = out_wh[:, 0, :]
-    h = out_wh[:, 1, :]
-
-    # Nhân 4 (down_ratio) để trả về kích thước 512x512
-    bboxes = torch.stack([
-        (xs - w / 2) * 4,
-        (ys - h / 2) * 4,
-        (xs + w / 2) * 4,
-        (ys + h / 2) * 4
-    ], dim=2)
-
-    return bboxes, scores, classes
+        # Áp dụng NMS riêng biệt cho từng class
+        keep = custom_nms(c_boxes, c_scores, iou_threshold=0.45)
+        for k in keep:
+            results.append({
+                "class": CLASSES[c],
+                "confidence": round(float(c_scores[k]), 4),
+                "bbox": c_boxes[k].tolist()
+            })
+    return results
 
 
-def main():
-    args = parse_args()
+def predict(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model_path = "./models/best.pth"
 
-    device = torch.device(
-        'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    # Tự động tải file tạ nếu chưa có
+    if not os.path.exists(model_path):
+        os.makedirs("models", exist_ok=True)
+        download_weights(model_path)
 
-    checkpoint_path = os.path.join("models", "best.pth")
-    download_model_if_missing(checkpoint_path)
+    model = IndoorDetector(num_classes=5).to(device)
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
 
-    model = CenterNet(num_classes=5).to(device)
-    if os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        print("[INFO] Đã tải trọng số mô hình thành công.")
     model.eval()
 
     results = []
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+    image_files = [f for f in os.listdir(args.image_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
 
-    image_files = [f for f in os.listdir(args.image_dir) if f.endswith(('.jpg', '.png'))]
-
-    for img_name in tqdm(image_files, desc="Predicting"):
+    for img_name in tqdm(image_files, desc="Đang suy luận (Inference)"):
         img_path = os.path.join(args.image_dir, img_name)
-        img_orig = cv2.imread(img_path)
-        if img_orig is None:
+        image = cv2.imread(img_path)
+        if image is None:
             continue
+        h_orig, w_orig = image.shape[:2]
 
-        h_orig, w_orig = img_orig.shape[:2]
-        img_rgb = cv2.cvtColor(img_orig, cv2.COLOR_BGR2RGB)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(image_rgb, (512, 512))
 
-        # Tiền xử lý Letterbox
-        img_pad, scale, dx, dy = letterbox_inference(img_rgb, (512, 512))
-
-        img_norm = img_pad.astype(np.float32) / 255.0
-        img_norm = (img_norm - mean) / std
-        img_tensor = torch.from_numpy(img_norm.transpose(2, 0, 1)).unsqueeze(0).to(device)
+        tensor = F.to_tensor(img_resized)
+        tensor = F.normalize(tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        tensor = tensor.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            hm, wh, reg = model(img_tensor)
-            bboxes, scores, classes = decode_centernet(hm, wh, reg, K=100)
+            preds = model(tensor)[0].cpu()
 
-        bboxes = bboxes[0]
-        scores = scores[0]
-        classes = classes[0]
+        boxes_pred = decode_predictions(preds, conf_thresh=0.25, stride=16, img_size=512)
 
-        # Khôi phục tọa độ: Trừ đi phần viền (dx, dy) và chia cho tỷ lệ scale
-        bboxes[:, [0, 2]] = (bboxes[:, [0, 2]] - dx) / scale
-        bboxes[:, [1, 3]] = (bboxes[:, [1, 3]] - dy) / scale
+        # Khôi phục tọa độ về kích thước ảnh gốc
+        scale_x = w_orig / 512.0
+        scale_y = h_orig / 512.0
 
-        # Kẹp tọa độ chặt chẽ trong phạm vi ảnh thật
-        bboxes[:, 0] = torch.clamp(bboxes[:, 0], min=0, max=w_orig)
-        bboxes[:, 1] = torch.clamp(bboxes[:, 1], min=0, max=h_orig)
-        bboxes[:, 2] = torch.clamp(bboxes[:, 2], min=0, max=w_orig)
-        bboxes[:, 3] = torch.clamp(bboxes[:, 3], min=0, max=h_orig)
+        final_boxes = []
+        for det in boxes_pred:
+            x1, y1, x2, y2 = det['bbox']
+            final_boxes.append({
+                "class": det['class'],
+                "confidence": det['confidence'],
+                "bbox": [
+                    round(x1 * scale_x, 2),
+                    round(y1 * scale_y, 2),
+                    round(x2 * scale_x, 2),
+                    round(y2 * scale_y, 2)
+                ]
+            })
 
-        img_result = {"image_id": img_name, "boxes": []}
-
-        # NMS độc lập cho từng lớp (Yêu cầu của Rubric)
-        for cls_id in range(len(CLASSES)):
-            mask = (classes == cls_id) & (scores >= args.conf_thresh)
-            cls_boxes = bboxes[mask]
-            cls_scores = scores[mask]
-
-            if len(cls_boxes) == 0:
-                continue
-
-            # NMS của Torchvision triệt tiêu các hộp bao trùng lặp
-            keep_indices = ops.nms(cls_boxes, cls_scores, args.iou_thresh)
-
-            for idx in keep_indices:
-                box = cls_boxes[idx].cpu().numpy().tolist()
-                score = cls_scores[idx].item()
-                img_result["boxes"].append({
-                    "class": CLASSES[cls_id],
-                    "confidence": round(float(score), 4),
-                    "bbox": [round(b, 2) for b in box]
-                })
-
-        results.append(img_result)
+        results.append({
+            "image_id": img_name,
+            "boxes": final_boxes
+        })
 
     with open(args.output, 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"\n[INFO] Đã xuất dự đoán ra {args.output}")
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"Đã xuất kết quả dự đoán thành công vào: {args.output}")
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_dir', type=str, required=True)
+    parser.add_argument('--output', type=str, required=True)
+    args = parser.parse_args()
+    predict(args)

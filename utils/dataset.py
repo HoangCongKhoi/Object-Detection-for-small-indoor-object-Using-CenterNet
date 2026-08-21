@@ -1,96 +1,24 @@
 import os
 import json
 import cv2
-import math
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import torchvision.transforms as T
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 CLASSES = ["bottle", "cup", "chair", "laptop", "backpack"]
-CLASS_TO_ID = {cls: i for i, cls in enumerate(CLASSES)}
+CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
 
 
-def gaussian_radius(det_size, min_overlap=0.7):
-    """Tính toán bán kính Gaussian dựa trên kích thước vật thể và ngưỡng IoU tối thiểu"""
-    height, width = det_size
-    a1 = 1
-    b1 = (height + width)
-    c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
-    sq1 = np.sqrt(b1 ** 2 - 4 * a1 * c1)
-    r1 = (b1 + sq1) / 2
-
-    a2 = 4
-    b2 = 2 * (height + width)
-    c2 = (1 - min_overlap) * width * height
-    sq2 = np.sqrt(b2 ** 2 - 4 * a2 * c2)
-    r2 = (b2 + sq2) / 2
-
-    a3 = 4 * min_overlap
-    b3 = -2 * min_overlap * (height + width)
-    c3 = (min_overlap - 1) * width * height
-    sq3 = np.sqrt(b3 ** 2 - 4 * a3 * c3)
-    r3 = (b3 + sq3) / 2
-    return min(r1, r2, r3)
-
-
-def draw_umich_gaussian(heatmap, center, radius, k=1):
-    """Vẽ vùng Gaussian xung quanh tâm vật thể trên Heatmap"""
-    diameter = 2 * radius + 1
-    gaussian = np.zeros((diameter, diameter), dtype=np.float32)
-
-    # THÊM MỚI: Ngăn lỗi chia cho 0 khi radius = 0 (vật thể quá nhỏ)
-    sigma = radius / 3 if radius > 0 else 1e-4
-
-    for i in range(diameter):
-        for j in range(diameter):
-            gaussian[i, j] = np.exp(-((i - radius) ** 2 + (j - radius) ** 2) / (2 * sigma ** 2))
-
-    x, y = int(center[0]), int(center[1])
-    height, width = heatmap.shape[0:2]
-
-    left, right = min(x, radius), min(width - x, radius + 1)
-    top, bottom = min(y, radius), min(height - y, radius + 1)
-
-    masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
-    masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
-    if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:
-        np.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
-    return heatmap
-
-def letterbox(img, bboxes, expected_size=(512, 512)):
-    """Resize ảnh giữ nguyên tỷ lệ, bù viền màu xám, cập nhật lại bboxes"""
-    ih, iw, _ = img.shape
-    ew, eh = expected_size
-    scale = min(ew / iw, eh / ih)
-    nw, nh = int(iw * scale), int(ih * scale)
-
-    img_resized = cv2.resize(img, (nw, nh))
-    new_img = np.full((eh, ew, 3), 128, dtype=np.uint8)  # Nền xám
-
-    dx, dy = (ew - nw) // 2, (eh - nh) // 2
-    new_img[dy:dy + nh, dx:dx + nw, :] = img_resized
-
-    new_bboxes = []
-    for bbox in bboxes:
-        xmin = bbox[0] * scale + dx
-        ymin = bbox[1] * scale + dy
-        xmax = bbox[2] * scale + dx
-        ymax = bbox[3] * scale + dy
-        new_bboxes.append([xmin, ymin, xmax, ymax, bbox[4]])
-
-    return new_img, np.array(new_bboxes), scale, dx, dy
-
-
-class CenterNetDataset(Dataset):
-    def __init__(self, json_file, img_dir, expected_size=(512, 512), is_train=True):
+class ObjectDetectionDataset(Dataset):
+    def __init__(self, annotation_file, img_dir, is_train=True, img_size=512, stride=16):
         self.img_dir = img_dir
-        self.expected_size = expected_size
-        self.is_train = is_train
-        self.down_ratio = 4
-        self.output_size = (expected_size[0] // self.down_ratio, expected_size[1] // self.down_ratio)
+        self.img_size = img_size
+        self.stride = stride
+        self.grid_size = img_size // stride  # Với img_size=512, stride=16 -> Grid 32x32
 
-        with open(json_file, 'r', encoding='utf-8') as f:
+        with open(annotation_file, 'r') as f:
             data = json.load(f)
 
         self.images = {img['id']: img for img in data['images']}
@@ -99,16 +27,35 @@ class CenterNetDataset(Dataset):
             img_id = ann['image_id']
             if img_id not in self.annotations:
                 self.annotations[img_id] = []
-            bbox = ann['bbox']  # [xmin, ymin, xmax, ymax]
-            cls_id = CLASS_TO_ID[ann['class']]
-            self.annotations[img_id].append(bbox + [cls_id])
+            self.annotations[img_id].append(ann)
 
         self.image_ids = list(self.images.keys())
 
-        # Chuẩn hóa ảnh
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
-        self.color_jitter = T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+        # TĂNG CƯỜNG DỮ LIỆU ĐẶC TRỊ CHO CHAIR & BACKPACK
+        if is_train:
+            self.transform = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                # Thay đổi ánh sáng mạnh để cứu balo bị chìm vào nền tối
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.6),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.4),
+                # Scale & Crop giúp mô hình học các nửa cái ghế / ghế bị cắt viền
+                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.15, rotate_limit=10, p=0.5,
+                                   border_mode=cv2.BORDER_CONSTANT),
+                # VŨ KHÍ BÍ MẬT: Giả lập che khuất. Xóa các vùng ngẫu nhiên
+                # Ép mô hình phải học toàn bộ đặc trưng của ghế/balo thay vì học vẹt 1 góc
+                A.CoarseDropout(max_holes=4, max_height=32, max_width=32, fill_value=0, p=0.4),
+
+                A.Resize(img_size, img_size),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels'], min_visibility=0.3))
+            # min_visibility=0.3: Tránh lỗi khi augmentation cắt mất >70% bbox thì bỏ bbox đó đi
+        else:
+            self.transform = A.Compose([
+                A.Resize(img_size, img_size),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
     def __len__(self):
         return len(self.image_ids)
@@ -118,75 +65,56 @@ class CenterNetDataset(Dataset):
         img_info = self.images[img_id]
         img_path = os.path.join(self.img_dir, img_info['file_name'].split('/')[-1])
 
-        img = cv2.imread(img_path)
-        if img is None:
-            raise FileNotFoundError(f"Không tìm thấy ảnh: {img_path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        bboxes = self.annotations.get(img_id, [])
-        bboxes = np.array(bboxes, dtype=np.float32)
+        bboxes, labels = [], []
+        if img_id in self.annotations:
+            for ann in self.annotations[img_id]:
+                x1, y1, x2, y2 = ann['bbox']
+                # Xử lý nhiễu data: Đôi khi nhãn bị lố ra ngoài ảnh
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(img_info['width'], x2), min(img_info['height'], y2)
 
-        # 1. Letterbox resizing
-        img, bboxes, _, _, _ = letterbox(img, bboxes, self.expected_size)
+                if x2 > x1 + 2 and y2 > y1 + 2:  # Bỏ qua rác (vật thể quá hẹp)
+                    bboxes.append([x1, y1, x2, y2])
+                    labels.append(CLASS_TO_IDX[ann['class']])
 
-        # 2. Data Augmentation cho tập Train
-        if self.is_train:
-            # Color Jitter
-            img_pil = T.ToPILImage()(img)
-            img = np.array(self.color_jitter(img_pil))
+        # Áp dụng Augmentation
+        transformed = self.transform(image=image, bboxes=bboxes, labels=labels)
+        image = transformed['image']
+        trans_bboxes = transformed['bboxes']
+        trans_labels = transformed['labels']
 
-            # Lật ngang (Horizontal Flip) xác suất 50%
-            if np.random.rand() < 0.5:
-                img = cv2.flip(img, 1)
-                if len(bboxes) > 0:
-                    ew = self.expected_size[0]
-                    bboxes[:, [0, 2]] = ew - bboxes[:, [2, 0]]
+        # Khởi tạo target tensor: 5 class + 1 conf + 4 bbox = 10 channels
+        target = torch.zeros((10, self.grid_size, self.grid_size))
 
-        # Chuẩn hóa ảnh
-        img = img.astype(np.float32) / 255.0
-        img = (img - self.mean) / self.std
-        img = img.transpose(2, 0, 1)  # HWC -> CHW
+        # CHIẾN THUẬT: Sắp xếp bboxes theo diện tích giảm dần.
+        # Lý do: Nếu cái cốc (nhỏ) nằm trên cái bàn/ghế (to) và trùng tâm cell,
+        # vòng lặp sẽ gán cái to trước, cái nhỏ sau đè lên. Không bị mất object nhỏ.
+        areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in trans_bboxes]
+        sorted_indices = np.argsort(areas)[::-1]  # Từ to đến nhỏ
 
-        # 3. Khởi tạo nhãn đầu ra (Heatmap, WH, Reg)
-        num_classes = len(CLASSES)
-        out_w, out_h = self.output_size
+        for idx in sorted_indices:
+            bbox = trans_bboxes[idx]
+            label = trans_labels[idx]
 
-        hm = np.zeros((num_classes, out_h, out_w), dtype=np.float32)
-        wh = np.zeros((100, 2), dtype=np.float32)  # Giới hạn tối đa 100 vật thể
-        reg = np.zeros((100, 2), dtype=np.float32)
-        ind = np.zeros((100), dtype=np.int64)
-        reg_mask = np.zeros((100), dtype=np.uint8)
+            x1, y1, x2, y2 = bbox
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            w, h = x2 - x1, y2 - y1
 
-        # Sinh Ground Truth
-        for i, bbox in enumerate(bboxes):
-            if i >= 100: break
+            # Tính chỉ số cell trên ô lưới
+            cell_x = int(cx / self.stride)
+            cell_y = int(cy / self.stride)
 
-            # Thu nhỏ bbox theo down_ratio
-            bbox_down = bbox[:4] / self.down_ratio
-            cls_id = int(bbox[4])
+            if 0 <= cell_x < self.grid_size and 0 <= cell_y < self.grid_size:
+                target[label, cell_y, cell_x] = 1.0  # One-hot Class
+                target[5, cell_y, cell_x] = 1.0  # Objectness (Có vật thể)
 
-            h, w = bbox_down[3] - bbox_down[1], bbox_down[2] - bbox_down[0]
-            if h > 0 and w > 0:
-                radius = gaussian_radius((math.ceil(h), math.ceil(w)))
-                radius = max(0, int(radius))
+                # Bounding box regression targets (Scale độc lập với kích thước ảnh)
+                target[6, cell_y, cell_x] = (cx / self.stride) - cell_x  # tx (0 -> 1)
+                target[7, cell_y, cell_x] = (cy / self.stride) - cell_y  # ty (0 -> 1)
+                target[8, cell_y, cell_x] = np.log((w / self.stride) + 1e-8)  # tw
+                target[9, cell_y, cell_x] = np.log((h / self.stride) + 1e-8)  # th
 
-                ct = np.array([(bbox_down[0] + bbox_down[2]) / 2, (bbox_down[1] + bbox_down[3]) / 2], dtype=np.float32)
-                ct_int = ct.astype(np.int32)
-
-                # Vẽ Heatmap
-                draw_umich_gaussian(hm[cls_id], ct_int, radius)
-
-                # Lưu thông tin W, H và Offset
-                wh[i] = 1. * w, 1. * h
-                ind[i] = ct_int[1] * out_w + ct_int[0]
-                reg[i] = ct - ct_int
-                reg_mask[i] = 1
-
-        return {
-            'image': torch.from_numpy(img),
-            'hm': torch.from_numpy(hm),
-            'wh': torch.from_numpy(wh),
-            'reg': torch.from_numpy(reg),
-            'ind': torch.from_numpy(ind),
-            'reg_mask': torch.from_numpy(reg_mask)
-        }
+        return image, target
