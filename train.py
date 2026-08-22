@@ -13,19 +13,19 @@ from loss import CenterNetLoss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Huấn luyện CenterNet từ đầu")
+    # KHÔNG dùng default cho đường dẫn để ép người dùng phải truyền vào
     parser.add_argument('--train_data', type=str, required=True, help='Đường dẫn file train.json')
     parser.add_argument('--val_data', type=str, required=True, help='Đường dẫn file val.json')
     parser.add_argument('--image_dir', type=str, required=True, help='Đường dẫn thư mục ảnh train')
     parser.add_argument('--val_image_dir', type=str, required=True, help='Đường dẫn thư mục ảnh val')
     parser.add_argument('--checkpoint_dir', type=str, required=True, help='Thư mục lưu model best.pth')
 
-    # Các tham số siêu tham số (Hyperparameters)
+    # Các tham số siêu tham số thì có thể để default
     parser.add_argument('--batch_size', type=int, default=8, help='Batch size (giảm xuống 4 nếu hết VRAM)')
     parser.add_argument('--epochs', type=int, default=50, help='Số lượng epochs')
     parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate ban đầu')
     parser.add_argument('--img_size', type=int, default=512, help='Kích thước ảnh đầu vào')
     return parser.parse_args()
-
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
     model.train()
