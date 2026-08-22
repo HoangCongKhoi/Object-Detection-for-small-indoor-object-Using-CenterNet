@@ -110,3 +110,4 @@ def create_dataloaders(train_json, val_json, train_img_dir, val_img_dir, batch_s
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, collate_fn=collate_fn,
                             pin_memory=True)
 
+    return train_loader, val_loader
